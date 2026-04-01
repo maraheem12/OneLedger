@@ -100,7 +100,7 @@ export default function DashboardPage() {
     reset,
     formState: { errors, isSubmitting },
   } = useForm<CreateRecordValues>({
-    resolver: zodResolver(createRecordSchema),
+    resolver: zodResolver(createRecordSchema) as any,
     defaultValues: {
       type: "INCOME",
     },
