@@ -2,14 +2,15 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { motion, AnimatePresence } from "framer-motion";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import * as z from "zod";
+import { Plus, Trash2, X, Activity, DollarSign, Wallet, Loader2 } from "lucide-react";
+import axiosInstance from "@/lib/axios";
+import { useAuth } from "@/providers/AuthProvider";
 
 // Define strict types corresponding to our DB output
-interface User {
-  id: string;
-  email: string;
-  role: "VIEWER" | "ANALYST" | "ADMIN";
-}
-
 interface RecordType {
   _id: string;
   amount: number;
@@ -27,326 +28,460 @@ interface SummaryData {
   categoryTotals: Record<string, number>;
 }
 
-export default function DashboardPage() {
-  const router = useRouter();
-  const [user, setUser] = useState<User | null>(null);
-  const [records, setRecords] = useState<RecordType[]>([]);
-  const [summary, setSummary] = useState<SummaryData | null>(null);
-  const [loading, setLoading] = useState(true);
+// Validation schema for creating a record
+const createRecordSchema = z.object({
+  amount: z.coerce.number().positive("Amount must be a positive number"),
+  type: z.enum(["INCOME", "EXPENSE"]),
+  category: z.string().min(1, "Category is required"),
+  notes: z.string().optional(),
+});
 
-  // Form state for ADMINs to create new records
-  const [amount, setAmount] = useState("");
-  const [type, setType] = useState("INCOME");
-  const [category, setCategory] = useState("");
-  const [notes, setNotes] = useState("");
+type CreateRecordValues = z.infer<typeof createRecordSchema>;
 
-  const getToken = () => localStorage.getItem("token");
+const containerVariants = {
+  hidden: { opacity: 0 },
+  show: {
+    opacity: 1,
+    transition: {
+      staggerChildren: 0.1,
+    },
+  },
+};
+
+const itemVariants = {
+  hidden: { opacity: 0, y: 20 },
+  show: { opacity: 1, y: 0, transition: { type: "spring", stiffness: 300, damping: 24 } },
+};
+
+// Simple animated counter component acting as a Spring natively without heavy dependencies
+function AnimatedCounter({ value, prefix = "" }: { value: number; prefix?: string }) {
+  const [count, setCount] = useState(0);
 
   useEffect(() => {
-    // Basic verification of token presence
-    const token = getToken();
-    const storedUser = localStorage.getItem("user");
+    const duration = 1200;
+    const steps = 60;
+    const stepTime = duration / steps;
+    let currentStep = 0;
 
-    if (!token || !storedUser) {
+    const timer = setInterval(() => {
+      currentStep++;
+      const progress = currentStep / steps;
+      // Fast start, slow fade end easing (ease-out cubic)
+      const easeProgress = 1 - Math.pow(1 - progress, 3);
+      setCount(value * easeProgress);
+
+      if (currentStep >= steps) {
+        clearInterval(timer);
+        setCount(value);
+      }
+    }, stepTime);
+
+    return () => clearInterval(timer);
+  }, [value]);
+
+  return <span>{prefix}{count.toFixed(2)}</span>;
+}
+
+export default function DashboardPage() {
+  const router = useRouter();
+  const { user, isAuthenticated, isLoading, logout } = useAuth();
+  
+  const [records, setRecords] = useState<RecordType[]>([]);
+  const [summary, setSummary] = useState<SummaryData | null>(null);
+  const [fetchingData, setFetchingData] = useState(true);
+  
+  // Modal state
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [formError, setFormError] = useState("");
+
+  const {
+    register,
+    handleSubmit,
+    reset,
+    formState: { errors, isSubmitting },
+  } = useForm<CreateRecordValues>({
+    resolver: zodResolver(createRecordSchema),
+    defaultValues: {
+      type: "INCOME",
+    },
+  });
+
+  useEffect(() => {
+    if (!isLoading && !isAuthenticated) {
       router.push("/login");
-      return;
     }
+  }, [isLoading, isAuthenticated, router]);
 
-    const parsedUser = JSON.parse(storedUser);
-    setUser(parsedUser);
-    
-    // Once user is identified, fetch the appropriate data block
-    fetchData(parsedUser.role);
-  }, [router]);
-
-  const fetchData = async (role: string) => {
-    await fetchRecords();
-    
-    // We only fetch summary metrics if the user is an ADMIN or ANALYST
-    if (role === "ADMIN" || role === "ANALYST") {
-      await fetchSummary();
+  useEffect(() => {
+    if (user) {
+      loadDashboardData(user.role);
     }
-    
-    setLoading(false);
-  };
+  }, [user]);
 
-  const fetchRecords = async () => {
+  const loadDashboardData = async (role: string) => {
+    setFetchingData(true);
     try {
-      const res = await fetch("/api/records", {
-        headers: { Authorization: `Bearer ${getToken()}` },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setRecords(data.records);
-      } else if (res.status === 401 || res.status === 403) {
-        handleLogout(); // Token might be expired or invalid
-      }
-    } catch (err) {
-      console.error("Failed to fetch records:", err);
-    }
-  };
-
-  const fetchSummary = async () => {
-    try {
-      const res = await fetch("/api/dashboard/summary", {
-        headers: { Authorization: `Bearer ${getToken()}` },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setSummary(data.summary);
-      }
-    } catch (err) {
-      console.error("Failed to fetch summary:", err);
-    }
-  };
-
-  const handleCreate = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      const res = await fetch("/api/records", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${getToken()}`,
-        },
-        body: JSON.stringify({
-          amount: Number(amount),
-          type,
-          category,
-          notes,
-        }),
-      });
+      const recordsPromise = axiosInstance.get("/records");
       
-      if (res.ok) {
-        // Reset form controls
-        setAmount("");
-        setCategory("");
-        setNotes("");
-        // Reload dashboard state to update both list and summary
-        fetchData(user!.role);
+      if (role === "ADMIN" || role === "ANALYST") {
+        const [recordsRes, summaryRes] = await Promise.all([
+          recordsPromise,
+          axiosInstance.get("/dashboard/summary")
+        ]);
+        setRecords(recordsRes.data.records);
+        setSummary(summaryRes.data.summary);
       } else {
-        const errorData = await res.json();
-        alert(`Error: ${errorData.error || "Failed to create record"}`);
+        const recordsRes = await recordsPromise;
+        setRecords(recordsRes.data.records);
       }
-    } catch (err) {
-      console.error("Create Record Exception:", err);
+    } catch (err: any) {
+      console.error("Failed to fetch dashboard data:", err);
+      if (err.response?.status === 401 || err.response?.status === 403) {
+        logout();
+      }
+    } finally {
+      setFetchingData(false);
+    }
+  };
+
+  const onSubmitRecord = async (data: CreateRecordValues) => {
+    setFormError("");
+    try {
+      await axiosInstance.post("/records", data);
+      setIsModalOpen(false);
+      reset();
+      // Reload UI organically Post-create
+      if (user) loadDashboardData(user.role);
+    } catch (err: any) {
+      setFormError(err.response?.data?.error || "Failed to create record");
     }
   };
 
   const handleDelete = async (id: string) => {
-    if (!confirm("Are you sure you want to permanently delete this record?")) return;
-    
+    if (!confirm("Delete this record permanently?")) return;
     try {
-      const res = await fetch(`/api/records/${id}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${getToken()}` },
-      });
-      
-      if (res.ok) {
-        fetchData(user!.role);
-      } else {
-        alert("Failed to delete record. Ensure you have Admin privileges.");
-      }
+      await axiosInstance.delete(`/records/${id}`);
+      if (user) loadDashboardData(user.role);
     } catch (err) {
-      console.error("Delete Action Exception:", err);
+      console.error("Delete failed:", err);
+      alert("Failed to delete record.");
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem("token");
-    localStorage.removeItem("user");
-    router.push("/login");
-  };
-
-  if (loading || !user) {
+  // Prevent UI flashing until initialized securely
+  if (isLoading || !user) {
     return (
-      <div className="flex justify-center items-center h-screen bg-gray-50">
-        <div className="animate-pulse flex flex-col items-center">
-          <div className="h-12 w-12 bg-blue-300 rounded-full mb-4"></div>
-          <p className="text-gray-500 font-medium">Authorizing & Fetching Dashboard Context...</p>
-        </div>
+      <div className="flex flex-col justify-center items-center h-screen bg-gray-50/50">
+        <motion.div
+          animate={{ rotate: 360 }}
+          transition={{ repeat: Infinity, duration: 1, ease: "linear" }}
+        >
+          <Loader2 className="w-12 h-12 text-blue-600 mb-4" />
+        </motion.div>
+        <span className="text-gray-500 font-semibold animate-pulse">Establishing secure tunnel...</span>
       </div>
     );
   }
 
-  // Determine RBAC toggles for UI render structure
+  // RBAC dynamic display limits
   const showSummary = user.role === "ADMIN" || user.role === "ANALYST";
   const showAdminControls = user.role === "ADMIN";
 
   return (
-    <div className="min-h-screen bg-gray-100 p-6 md:p-10">
-      <div className="max-w-7xl mx-auto space-y-8">
-        {/* Header Section */}
-        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center bg-white p-6 rounded-xl shadow-sm border border-gray-200">
-          <div>
-            <h1 className="text-3xl font-extrabold text-gray-900 tracking-tight">OneLedger Dashboard</h1>
-            <p className="text-gray-500 mt-1">Logged in as {user.email}</p>
+    <div className="min-h-screen bg-gray-50/50 text-gray-900 pb-24">
+      {/* Top Navbar */}
+      <nav className="bg-white/90 backdrop-blur-md sticky top-0 z-30 border-b border-gray-200/60 shadow-[0_4px_20px_-10px_rgba(0,0,0,0.05)]">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 bg-blue-600 rounded-xl flex items-center justify-center transform -rotate-3 shadow-md shadow-blue-500/20">
+              <Activity className="text-white w-5 h-5 rotate-3" />
+            </div>
+            <span className="font-extrabold text-xl tracking-tight hidden sm:block">OneLedger</span>
           </div>
-          <div className="flex items-center gap-4 mt-4 sm:mt-0">
-            <span className={`px-4 py-1.5 rounded-full text-sm font-bold tracking-wide uppercase ${
-              user.role === 'ADMIN' ? 'bg-indigo-100 text-indigo-800' :
-              user.role === 'ANALYST' ? 'bg-blue-100 text-blue-800' :
-              'bg-gray-100 text-gray-800'
-            }`}>
-              {user.role}
-            </span>
-            <button 
-              onClick={handleLogout} 
-              className="px-4 py-1.5 text-sm bg-red-50 text-red-600 hover:bg-red-100 rounded-lg font-bold transition-colors"
+          
+          <div className="flex items-center gap-5">
+             <div className="text-right hidden sm:block">
+              <p className="text-sm font-bold text-gray-900 leading-none">{user.email}</p>
+              <p className="text-xs text-blue-600 font-bold mt-1 tracking-widest">{user.role}</p>
+            </div>
+            <div className="h-6 w-px bg-gray-200"></div>
+            <button
+              onClick={logout}
+              className="pl-2 text-sm font-bold text-gray-500 hover:text-red-600 transition-colors"
             >
-              Sign Out
+              Sign out
             </button>
           </div>
         </div>
+      </nav>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 mt-2 space-y-10">
+        
+        {/* Animated Greeting Statement */}
+        <motion.div
+          initial={{ opacity: 0, y: -20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5 }}
+        >
+          <h1 className="text-3xl font-extrabold tracking-tight text-gray-900">
+            Welcome back, <span className="text-blue-600">{user.email}</span> <span className="text-gray-400 font-medium">({user.role})</span>
+          </h1>
+          <p className="text-gray-500 mt-2 font-medium">Here is your comprehensive financial overview.</p>
+        </motion.div>
 
         {/* Dynamic RBAC Component: Analytics Summary */}
         {showSummary && summary && (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex flex-col">
-              <span className="text-gray-500 text-sm font-semibold uppercase tracking-wider">Total Income</span>
-              <span className="text-3xl font-bold text-green-600 mt-2">${summary.totalIncome.toFixed(2)}</span>
-            </div>
-            <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex flex-col">
-              <span className="text-gray-500 text-sm font-semibold uppercase tracking-wider">Total Expenses</span>
-              <span className="text-3xl font-bold text-red-600 mt-2">${summary.totalExpenses.toFixed(2)}</span>
-            </div>
-            <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex flex-col">
-              <span className="text-gray-500 text-sm font-semibold uppercase tracking-wider">Net Balance</span>
-              <span className={`text-3xl font-bold mt-2 ${summary.netBalance >= 0 ? 'text-blue-600' : 'text-orange-600'}`}>
-                ${summary.netBalance.toFixed(2)}
-              </span>
-            </div>
-          </div>
+          <motion.div
+            variants={containerVariants}
+            initial="hidden"
+            animate="show"
+            className="grid grid-cols-1 md:grid-cols-3 gap-6"
+          >
+            <motion.div variants={itemVariants} className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 flex items-center gap-5 hover:border-green-200 transition-colors group">
+              <div className="w-14 h-14 rounded-2xl bg-green-50 flex items-center justify-center group-hover:scale-110 transition-transform">
+                 <DollarSign className="w-7 h-7 text-green-600" />
+              </div>
+              <div>
+                <p className="text-sm font-bold text-gray-400 uppercase tracking-widest">Total Income</p>
+                <div className="text-3xl font-extrabold text-gray-900 mt-1 tracking-tight">
+                  <AnimatedCounter value={summary.totalIncome} prefix="$" />
+                </div>
+              </div>
+            </motion.div>
+
+            <motion.div variants={itemVariants} className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 flex items-center gap-5 hover:border-red-200 transition-colors group">
+              <div className="w-14 h-14 rounded-2xl bg-red-50 flex items-center justify-center group-hover:scale-110 transition-transform">
+                 <Activity className="w-7 h-7 text-red-600" />
+              </div>
+              <div>
+                <p className="text-sm font-bold text-gray-400 uppercase tracking-widest">Total Expenses</p>
+                <div className="text-3xl font-extrabold text-gray-900 mt-1 tracking-tight">
+                  <AnimatedCounter value={summary.totalExpenses} prefix="$" />
+                </div>
+              </div>
+            </motion.div>
+
+            <motion.div variants={itemVariants} className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 flex items-center gap-5 hover:border-blue-200 transition-colors group">
+              <div className="w-14 h-14 rounded-2xl bg-blue-50 flex items-center justify-center group-hover:scale-110 transition-transform">
+                 <Wallet className="w-7 h-7 text-blue-600" />
+              </div>
+              <div>
+                <p className="text-sm font-bold text-gray-400 uppercase tracking-widest">Net Balance</p>
+                <div className={`text-3xl font-extrabold mt-1 tracking-tight ${summary.netBalance >= 0 ? "text-green-600" : "text-red-600"}`}>
+                  <AnimatedCounter value={summary.netBalance} prefix="$" />
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
         )}
 
-        <div className="flex flex-col lg:flex-row gap-8">
-          {/* Main Data Table */}
-          <div className="flex-1 bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
-            <div className="px-6 py-5 border-b border-gray-200 bg-gray-50">
-              <h2 className="text-lg font-bold text-gray-800">Financial Records Database</h2>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-white">
+        {/* Main Data Table Area (Framed & Staggered) */}
+        <motion.div
+          initial={{ opacity: 0, y: 30 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6, delay: 0.2 }}
+          className="bg-white border border-gray-200 rounded-[2rem] overflow-hidden shadow-[0_8px_30px_rgb(0,0,0,0.04)]"
+        >
+          <div className="px-8 py-6 border-b border-gray-100 bg-white flex justify-between items-center">
+            <h2 className="text-xl font-extrabold text-gray-900">Transaction History</h2>
+          </div>
+          
+          <div className="overflow-x-auto">
+            {fetchingData ? (
+               <div className="py-24 flex justify-center items-center text-gray-400">
+                  <Loader2 className="w-10 h-10 animate-spin text-blue-600" />
+               </div>
+            ) : records.length === 0 ? (
+               <div className="py-24 text-center text-gray-500 font-semibold bg-gray-50/50">
+                 No financial records found in the database.
+               </div>
+            ) : (
+              <table className="min-w-full divide-y divide-gray-100">
+                <thead className="bg-gray-50/50 whitespace-nowrap">
                   <tr>
-                    <th className="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">Date</th>
-                    <th className="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">Type</th>
-                    <th className="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">Category</th>
-                    <th className="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">Amount</th>
+                    <th className="px-8 py-5 text-left text-xs font-bold text-gray-400 uppercase tracking-widest">Date Issued</th>
+                    <th className="px-8 py-5 text-left text-xs font-bold text-gray-400 uppercase tracking-widest">Transaction Type</th>
+                    <th className="px-8 py-5 text-left text-xs font-bold text-gray-400 uppercase tracking-widest">Category Designation</th>
+                    <th className="px-8 py-5 text-left text-xs font-bold text-gray-400 uppercase tracking-widest">Total Amount</th>
                     {showAdminControls && (
-                      <th className="px-6 py-4 text-right text-xs font-bold text-gray-500 uppercase tracking-wider">Manage</th>
+                      <th className="px-8 py-5 text-right text-xs font-bold text-gray-400 uppercase tracking-widest">Manage</th>
                     )}
                   </tr>
                 </thead>
-                <tbody className="bg-white divide-y divide-gray-100">
+                <motion.tbody
+                  variants={containerVariants}
+                  initial="hidden"
+                  animate="show"
+                  className="bg-white divide-y divide-gray-50"
+                >
                   {records.map((record) => (
-                    <tr key={record._id} className="hover:bg-gray-50 transition-colors">
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
-                        {new Date(record.date).toLocaleDateString(undefined, {
-                          year: 'numeric', month: 'short', day: 'numeric'
-                        })}
+                    <motion.tr variants={itemVariants} key={record._id} className="hover:bg-gray-50/50 transition-colors group">
+                      <td className="px-8 py-5 whitespace-nowrap text-sm font-semibold text-gray-600">
+                        {new Date(record.date).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <span className={`px-2.5 py-1 inline-flex text-xs leading-5 font-bold rounded-full ${
-                          record.type === 'INCOME' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+                      <td className="px-8 py-5 whitespace-nowrap">
+                        <span className={`px-4 py-1.5 inline-flex text-[11px] font-extrabold uppercase tracking-widest rounded-full ${
+                          record.type === 'INCOME' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
                         }`}>
                           {record.type}
                         </span>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="text-sm font-medium text-gray-900">{record.category}</div>
-                        {record.notes && <div className="text-xs text-gray-400">{record.notes}</div>}
+                      <td className="px-8 py-5 whitespace-nowrap">
+                        <div className="text-sm font-bold text-gray-900">{record.category}</div>
+                        {record.notes && <div className="text-xs text-gray-400 font-medium mt-1">{record.notes}</div>}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900">
+                      <td className="px-8 py-5 whitespace-nowrap text-sm font-extrabold text-gray-900 tracking-tight">
                         ${record.amount.toFixed(2)}
                       </td>
                       {showAdminControls && (
-                        <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                        <td className="px-8 py-5 whitespace-nowrap text-right text-sm">
                           <button
                             onClick={() => handleDelete(record._id)}
-                            className="text-white bg-red-500 hover:bg-red-600 px-3 py-1.5 rounded-md text-xs transition-colors"
+                            className="p-2.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all opacity-0 group-hover:opacity-100 focus:opacity-100 outline-none"
+                            title="Delete Record"
                           >
-                            Delete
+                            <Trash2 className="w-5 h-5" />
                           </button>
                         </td>
                       )}
-                    </tr>
+                    </motion.tr>
                   ))}
-                  {records.length === 0 && (
-                    <tr>
-                      <td colSpan={showAdminControls ? 5 : 4} className="px-6 py-12 text-center text-gray-400">
-                        No financial records found.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
+                </motion.tbody>
               </table>
-            </div>
+            )}
           </div>
+        </motion.div>
+      </main>
 
-          {/* Dynamic RBAC Component: Admin Record Creator */}
-          {showAdminControls && (
-            <div className="w-full lg:w-1/3 bg-white rounded-xl shadow-sm border border-gray-200 h-fit sticky top-8">
-              <div className="px-6 py-5 border-b border-gray-200 bg-gray-50 rounded-t-xl">
-                <h2 className="text-lg font-bold text-gray-800">Add New Entry</h2>
-              </div>
-              <form onSubmit={handleCreate} className="p-6 space-y-5">
-                <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-1">Transaction Type</label>
-                  <select
-                    value={type}
-                    onChange={(e) => setType(e.target.value)}
-                    className="block w-full px-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors"
-                  >
-                    <option value="INCOME">Income</option>
-                    <option value="EXPENSE">Expense</option>
-                  </select>
+      {/* Floating Action Button (FAB) strictly reserved for Admins */}
+      {showAdminControls && (
+        <motion.button
+          initial={{ scale: 0 }}
+          animate={{ scale: 1 }}
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          onClick={() => setIsModalOpen(true)}
+          className="fixed bottom-10 right-10 w-16 h-16 bg-blue-600 text-white rounded-2xl shadow-xl shadow-blue-500/40 flex items-center justify-center z-40 transform-gpu"
+        >
+          <Plus className="w-8 h-8" />
+        </motion.button>
+      )}
+
+      {/* Animated Admin Creation Modal overlay */}
+      <AnimatePresence>
+        {isModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center px-4 overflow-hidden">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsModalOpen(false)}
+              className="absolute inset-0 bg-gray-900/30 backdrop-blur-md"
+            />
+            
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 30 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 30 }}
+              transition={{ type: "spring", damping: 25, stiffness: 300 }}
+              className="relative w-full max-w-lg bg-white rounded-[2rem] shadow-2xl p-8 sm:p-10 border border-white/20"
+            >
+              <button
+                onClick={() => setIsModalOpen(false)}
+                className="absolute top-6 right-6 p-2 text-gray-400 hover:text-gray-900 hover:bg-gray-100 rounded-full transition-colors"
+              >
+                <X className="w-6 h-6" />
+              </button>
+              
+              <h2 className="text-3xl font-extrabold text-gray-900 mb-2">Create Record</h2>
+              <p className="text-gray-500 font-medium mb-8">Register a localized financial activity entry into the database.</p>
+              
+              {formError && (
+                <div className="mb-6 p-3 rounded-xl bg-red-50 text-red-600 text-sm font-bold flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-red-600 block"></span>
+                  {formError}
                 </div>
-                <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-1">Amount ($)</label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0.01"
-                    value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
-                    required
-                    placeholder="0.00"
-                    className="block w-full px-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors"
-                  />
+              )}
+
+              <form onSubmit={handleSubmit(onSubmitRecord)} className="space-y-6">
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="col-span-2">
+                    <label className="block text-sm font-bold text-gray-700 mb-2">Transaction Scope</label>
+                    <select
+                      {...register("type")}
+                      className="block w-full px-4 py-3.5 bg-gray-50 border border-gray-200 rounded-xl text-sm font-bold focus:outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-500/20 transition-all appearance-none cursor-pointer"
+                      style={{ backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234B5563' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e")`, backgroundPosition: 'right 1rem center', backgroundRepeat: 'no-repeat', backgroundSize: '1.2em' }}
+                    >
+                      <option value="INCOME">Income (Target +)</option>
+                      <option value="EXPENSE">Expense (Target -)</option>
+                    </select>
+                  </div>
+                  
+                  <div className="col-span-2 sm:col-span-1">
+                    <label className="block text-sm font-bold text-gray-700 mb-2">Logged Amount ($)</label>
+                    <div className="relative">
+                      <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-gray-400">
+                        <DollarSign className="h-5 w-5" />
+                      </div>
+                      <input
+                        type="number"
+                        step="0.01"
+                        placeholder="0.00"
+                        {...register("amount")}
+                        className={`block w-full pl-10 pr-4 py-3.5 bg-gray-50 border ${
+                          errors.amount ? "border-red-400 focus:ring-red-500/20" : "border-gray-200 focus:border-blue-500 focus:ring-blue-500/20"
+                        } rounded-xl text-sm font-bold focus:outline-none focus:ring-4 transition-all`}
+                      />
+                    </div>
+                    <AnimatePresence>
+                      {errors.amount && (
+                        <motion.p initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="mt-2 text-xs text-red-500 font-bold">{errors.amount.message}</motion.p>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                  
+                  <div className="col-span-2 sm:col-span-1">
+                    <label className="block text-sm font-bold text-gray-700 mb-2">Category Sector</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Infrastructure"
+                      {...register("category")}
+                      className={`block w-full px-4 py-3.5 bg-gray-50 border ${
+                        errors.category ? "border-red-400 focus:ring-red-500/20" : "border-gray-200 focus:border-blue-500 focus:ring-blue-500/20"
+                      } rounded-xl text-sm font-bold focus:outline-none focus:ring-4 transition-all`}
+                    />
+                    <AnimatePresence>
+                      {errors.category && (
+                        <motion.p initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="mt-2 text-xs text-red-500 font-bold">{errors.category.message}</motion.p>
+                      )}
+                    </AnimatePresence>
+                  </div>
                 </div>
+                
                 <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-1">Category</label>
+                  <label className="block text-sm font-bold text-gray-700 mb-2">Operational Notes <span className="text-gray-400 font-medium">(Optional)</span></label>
                   <input
                     type="text"
-                    value={category}
-                    onChange={(e) => setCategory(e.target.value)}
-                    required
-                    placeholder="e.g. Server Hosting"
-                    className="block w-full px-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors"
+                    placeholder="Brief description outlining context"
+                    {...register("notes")}
+                    className="block w-full px-4 py-3.5 bg-gray-50 border border-gray-200 focus:border-blue-500 focus:ring-blue-500/20 rounded-xl text-sm font-bold focus:outline-none focus:ring-4 transition-all"
                   />
                 </div>
-                <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-1">Context Notes (Optional)</label>
-                  <input
-                    type="text"
-                    value={notes}
-                    onChange={(e) => setNotes(e.target.value)}
-                    placeholder="Details about this entry"
-                    className="block w-full px-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors"
-                  />
-                </div>
-                <button
+
+                <motion.button
+                  whileHover={{ scale: 1.01 }}
+                  whileTap={{ scale: 0.98 }}
                   type="submit"
-                  className="w-full py-2.5 px-4 rounded-lg shadow-sm text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all mt-6"
+                  disabled={isSubmitting}
+                  className="w-full flex items-center justify-center py-4 px-4 bg-blue-600 text-white rounded-xl font-extrabold text-sm shadow-xl shadow-blue-500/30 hover:bg-blue-700 focus:outline-none focus:ring-4 focus:ring-blue-500/50 transition-all disabled:opacity-70 mt-8"
                 >
-                  Create Record
-                </button>
+                  {isSubmitting ? <Loader2 className="w-5 h-5 animate-spin mr-2" /> : "Commit Transaction"}
+                </motion.button>
               </form>
-            </div>
-          )}
-        </div>
-      </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
