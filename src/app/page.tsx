@@ -111,7 +111,7 @@ export default function Home() {
             </Link>
             
             {/* 6. Documentation Button */}
-            <Link href="https://drive.google.com/file/d/1BYrX8g008ti1fWecxx0OS9nWzHdb_qRo/view?usp=sharing" className="w-full sm:w-auto px-8 py-4 bg-white/5 border border-white/10 text-white rounded-full font-medium flex items-center justify-center gap-2 hover:bg-white/10 transition-all active:scale-95">
+            <Link href="https://drive.google.com/file/d/1KFZYiFOmBjMdeGyGyJhKP_Nb6SU2CcbP/view?usp=sharing" className="w-full sm:w-auto px-8 py-4 bg-white/5 border border-white/10 text-white rounded-full font-medium flex items-center justify-center gap-2 hover:bg-white/10 transition-all active:scale-95">
               <BookOpen className="w-4 h-4 text-zinc-400" /> View Documentation
             </Link>
           </motion.div>
